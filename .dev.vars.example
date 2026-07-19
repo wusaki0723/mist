@@ -1,0 +1,4 @@
+# Copy to .dev.vars for `npm run dev` (gitignored). Never commit real values.
+PROXY_API_KEY=dev-local-only-change-me
+CLAUDE_OAUTH_TOKEN=sk-ant-oat01-paste-your-setup-token-here
+# CLOAK=false

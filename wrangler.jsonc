@@ -1,0 +1,15 @@
+{
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "claude-oauth-worker",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-07-01",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"workers_dev": true
+	// Secrets (set via `wrangler secret put`):
+	// - PROXY_API_KEY       client-facing key for Hana / Claude Code / scripts
+	// - CLAUDE_OAUTH_TOKEN  sk-ant-oat01-... from `claude setup-token` (valid ~1 year)
+	// Optional:
+	// - CLOAK               "false" to disable Claude Code system-prefix injection
+}

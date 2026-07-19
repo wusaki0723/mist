@@ -1,0 +1,19 @@
+{
+  "name": "claude-oauth-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Claude Pro/Max setup-token as a private Anthropic-compatible endpoint, via Cloudflare Worker",
+  "license": "MIT",
+  "repository": "github:wusaki0723/claude-oauth-worker",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "types": "wrangler types"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260708.0",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.112.0"
+  }
+}
