@@ -1,42 +1,45 @@
-# claude-oauth-worker
+# mist
 
-Expose your Claude Pro/Max subscription as a private, Anthropic-compatible API endpoint — backed by a Cloudflare Worker and the 1-year `setup-token`. No refresh tokens, no KV, no servers.
+A privacy passthrough relay for the Anthropic API, on Cloudflare Workers.
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/wusaki0723/claude-oauth-worker)
+Your requests leave from a clean, fixed edge egress — not from your device.
 
----
-
-## ⚠️ Disclaimer — read this first
-
-This project routes your Claude **subscription** OAuth token (from `claude setup-token`) through a proxy so that arbitrary Anthropic-API clients can use it.
-
-- Anthropic's terms restrict subscription OAuth tokens to the **official Claude Code** product. Routing them to other clients may violate Anthropic's Terms of Service.
-- This Worker prepends the Claude Code system-prompt prefix ("cloak") to satisfy a server-side check that otherwise limits OAuth tokens to Haiku-class models. That is a deliberate workaround of an upstream restriction.
-- **Using this project may get your Claude account rate-limited, suspended, or banned.**
-
-Provided strictly as-is, for educational and personal use. **You assume all risk.** The authors accept no liability for account actions, lost subscriptions, or any other damages. If losing your Claude account would hurt, don't use this.
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/wusaki0723/mist)
 
 ---
 
-## Features
+## Why
 
-- **setup-token only** — one long-lived (~1 year) token, no refresh flow, no KV, zero state
-- **Your token never leaves the Worker** — clients authenticate with your own `PROXY_API_KEY`
-- **Cloak built in** — Sonnet/Opus work out of the box; disable if you want
-- **Pure passthrough** — streaming, tool use, vision: whatever the Messages API supports
-- **One-click deploy** — no KV namespaces or other resources to provision
+Official OAuth login flows collect client-side device and environment signals. mist sits in between as a transparent relay: your client talks to mist, mist talks to `api.anthropic.com`. Upstream sees a uniform, minimal request shape from a consistent edge location — your device fingerprint and network environment stay out of the picture.
 
-## Quick start
+mist **stores nothing, logs nothing, and inspects nothing** beyond what is required to normalize auth headers in flight. It is a pipe, not a product.
 
-### 1. Get your setup token
+## What it is
 
-Requires an active Claude Pro/Max subscription and Claude Code installed:
+- **Pure passthrough** — streaming, tool use, vision: whatever the Messages API supports, mist forwards untouched
+- **Long-lived token, zero state** — one ~1-year token held in Cloudflare's secret store; no refresh flow, no KV, no database. Clients authenticate to mist with your own `PROXY_API_KEY`; the real token never leaves the edge
+- **Request normalization** — outgoing requests are shaped to match the official client, preserving full model compatibility (optional, can be disabled)
+- **One-click deploy** — no resources to provision
+
+## Recommended use
+
+mist is meant for **Claude Code and official Claude SDKs only**, via their standard custom-endpoint settings (`ANTHROPIC_BASE_URL` / SDK `baseURL`). It is not a general-purpose API gateway and is shared at your own discretion within your own circle.
+
+## ⚠️ Use at your own risk
+
+mist is a personal networking tool. Whether routing your account's traffic through a relay complies with upstream terms of service is your own determination to make. Account restrictions are a possibility you accept by using this. Provided as-is, without warranty of any kind; the authors accept no liability for account actions or any other damages. If losing access to your account would hurt, don't use it.
+
+## Setup
+
+### 1. Get a long-lived token
+
+Requires an active Claude subscription and Claude Code installed:
 
 ```bash
 claude setup-token
 ```
 
-Authorize in the browser; the terminal prints a `sk-ant-oat01-...` token valid for ~1 year. **It is shown once — copy it immediately.**
+Authorize in the browser; the terminal prints a token valid for ~1 year. **It is shown once — copy it immediately.**
 
 ### 2. Deploy
 
@@ -45,8 +48,8 @@ Click the button above, connect your GitHub account, and Cloudflare will fork an
 Prefer the CLI?
 
 ```bash
-git clone https://github.com/wusaki0723/claude-oauth-worker
-cd claude-oauth-worker
+git clone https://github.com/wusaki0723/mist
+cd mist
 npm install
 npx wrangler login
 npm run deploy
@@ -54,23 +57,23 @@ npm run deploy
 
 ### 3. Add secrets
 
-Cloudflare dashboard → **Workers & Pages → claude-oauth-worker → Settings → Variables and Secrets → Add** (type: Secret):
+Cloudflare dashboard → **Workers & Pages → mist → Settings → Variables and Secrets → Add** (type: Secret):
 
 | Secret | Value |
 |---|---|
-| `CLAUDE_OAUTH_TOKEN` | your `sk-ant-oat01-...` setup token |
+| `CLAUDE_OAUTH_TOKEN` | the token from step 1 |
 | `PROXY_API_KEY` | a long random string you invent — this is the key your clients will use |
 
-Saving a secret triggers a new deployment automatically; no redeploy needed.
+Saving a secret triggers a new deployment automatically.
 
 ### 4. Verify
 
 ```bash
 curl https://<your-worker>.<subdomain>.workers.dev/health
-# → { "hasToken": true, "looksLikeSetupToken": true, "cloak": true, ... }
+# → { "hasToken": true, "looksLikeSetupToken": true, ... }
 ```
 
-### 5. Point your client at it
+### 5. Connect your client
 
 **Claude Code:**
 
@@ -80,19 +83,11 @@ export ANTHROPIC_API_KEY="<PROXY_API_KEY>"
 claude
 ```
 
-**Any Anthropic SDK / compatible app:** set base URL to `https://<your-worker>.<subdomain>.workers.dev` (no `/v1` suffix — clients append `/v1/messages` themselves), API key to your `PROXY_API_KEY`, and use official model ids (e.g. `claude-sonnet-4-6`).
+**Official SDKs:** set base URL to your worker address (no `/v1` suffix), API key to your `PROXY_API_KEY`, and use official model ids.
 
-## The cloak
+## Options
 
-Anthropic gates non-Haiku models behind a system-prompt check for OAuth tokens. The Worker therefore prepends:
-
-```
-You are Claude Code, Anthropic's official CLI for Claude.
-```
-
-to `system` on every request (skipped if the client already sent it, e.g. real Claude Code). Trade-off: the model may lean slightly toward coding-assistant mannerisms.
-
-To disable (you'll likely be limited to Haiku):
+Request normalization is on by default. To disable it (model availability may be reduced):
 
 ```bash
 npx wrangler secret put CLOAK   # enter: false
@@ -103,7 +98,7 @@ npx wrangler secret put CLOAK   # enter: false
 Upstream starts returning 401 after ~1 year. Then:
 
 ```bash
-claude setup-token                       # generate a fresh token
+claude setup-token                       # fresh token
 npx wrangler secret put CLAUDE_OAUTH_TOKEN
 ```
 
@@ -111,54 +106,41 @@ No redeploy needed.
 
 ## Security notes
 
-- `PROXY_API_KEY` is the only thing standing between the public internet and your subscription. Make it long and random.
-- Never commit secrets; the Worker reads them from Cloudflare's secret store only.
+- `PROXY_API_KEY` is the only thing between the public internet and your account. Make it long and random.
+- Never commit secrets; mist reads them from Cloudflare's secret store only.
 - The `*.workers.dev` URL is publicly reachable. Rotate both secrets if you suspect leakage.
 
 ---
 
 # 中文说明
 
-把你的 Claude Pro/Max 订阅变成一个私有的、Anthropic 兼容的 API 端点——基于 Cloudflare Worker 和一年期的 `setup-token`。没有 refresh token，没有 KV，没有服务器。
+Anthropic API 的隐私透传中继，跑在 Cloudflare Workers 上。
 
-## ⚠️ 风险声明——先看这个
+你的请求从一个干净、固定的边缘出口发出，而不是从你的设备。
 
-本项目把 Claude **订阅**的 OAuth token（`claude setup-token` 生成）通过反代给任意 Anthropic API 客户端使用。
+## 为什么
 
-- Anthropic 的条款限定订阅 OAuth token 只能用于**官方 Claude Code**。把它接给别的客户端可能违反 Anthropic 服务条款。
-- Worker 默认开启 cloak：给每个请求的 system 前面补 Claude Code 前缀，以通过服务端检测（否则只能用 Haiku 档模型）。这是对上游限制的主动规避。
-- **使用本项目可能导致你的 Claude 账号被限流、暂停或封禁。**
+官方 OAuth 登录流程会采集客户端的设备与环境信息。mist 夹在中间做透明中继：你的客户端连 mist，mist 连 `api.anthropic.com`。上游看到的只是一个来自固定边缘节点的、形态统一的干净请求——你的设备指纹和网络环境不会暴露。
 
-项目按原样提供，仅供学习研究和个人使用。**一切风险自负。**作者不对封号、订阅损失或任何其他损害负责。丢不起这个号，就别用。
+mist **不存储、不记录、不窥探**任何请求内容，只在转发途中做必要的认证头归一化。它是一根管子，不是一个产品。
 
-## 快速上手
+## 推荐使用
 
-1. **拿 token**（需要 Pro/Max 订阅 + 本机有 Claude Code）：
-   ```bash
-   claude setup-token
-   ```
-   浏览器授权后终端打印 `sk-ant-oat01-...`，一年有效，**只显示一次，立刻复制**。
+mist 仅推荐配合 **Claude Code 和官方 Claude SDK** 使用，走它们标准的自定义端点设置（`ANTHROPIC_BASE_URL` / SDK 的 `baseURL`）。它不是通用 API 网关，请在自己的小圈子里自行斟酌分享。
 
-2. **部署**：点上面的 Deploy 按钮，连 GitHub，Cloudflare 自动 fork 并部署。
-   命令行党：`npm install && npx wrangler login && npm run deploy`。
+## ⚠️ 风险自担
 
-3. **加 secret**：CF 面板 → Workers & Pages → claude-oauth-worker → Settings → Variables and Secrets，类型选 Secret：
-   - `CLAUDE_OAUTH_TOKEN`：刚才那串 `sk-ant-oat01-...`
-   - `PROXY_API_KEY`：自己编一个长随机串（这就是客户端要用的 key）
+mist 是个人网络工具。把账号流量经由中继转发是否符合上游服务条款，由你自己判断。使用即表示你接受账号可能被限制的风险。项目按原样提供，无任何担保；作者不对账号处置或其他损失负责。丢不起这个号，就别用。
 
-4. **验证**：`curl https://<你的worker>.<subdomain>.workers.dev/health`，看到 `hasToken: true` 即可。
+## 上手
 
-5. **客户端**：base URL 填 Worker 地址（**不要带 `/v1`**），API key 填 `PROXY_API_KEY`，模型用官方 id（如 `claude-sonnet-4-6`）。
-
-## Cloak 开关
-
-OAuth token 的服务端策略：system 不以 Claude Code 前缀开头时，Sonnet/Opus 返回 `rate_limit_error`，只有 Haiku 能用。Worker 默认自动补前缀（客户端已带则跳过）。代价是模型可能略微偏编程助手人设。
-
-想关：`npx wrangler secret put CLOAK`，输入 `false`。但关了大概率只剩 Haiku。
-
-## Token 到期
-
-一年到期后上游返回 401。重跑 `claude setup-token` 拿新 token，`wrangler secret put CLAUDE_OAUTH_TOKEN` 换上即可，不用重新部署。
+1. **拿 token**（需要有效订阅 + 本机 Claude Code）：`claude setup-token`，浏览器授权后终端打印一年期 token，**只显示一次，立刻复制**
+2. **部署**：点上方按钮，或 `npm install && npx wrangler login && npm run deploy`
+3. **加 secret**：CF 面板 → Workers & Pages → mist → Settings → Variables and Secrets，类型 Secret：
+   - `CLAUDE_OAUTH_TOKEN`：第 1 步那串
+   - `PROXY_API_KEY`：自编长随机串（客户端用它认证）
+4. **验证**：`curl https://<你的worker>.<subdomain>.workers.dev/health` 看到 `hasToken: true`
+5. **接客户端**：base URL 填 Worker 地址（不带 `/v1`），API key 填 `PROXY_API_KEY`
 
 ## License
 

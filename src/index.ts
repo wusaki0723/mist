@@ -1,7 +1,8 @@
 /**
- * Claude setup-token passthrough proxy (no refresh, no KV).
+ * mist — Claude setup-token passthrough proxy (no refresh, no KV).
  *
- * Client → Worker (PROXY_API_KEY) → api.anthropic.com (Bearer setup-token + beta)
+ * Privacy relay: client → mist (PROXY_API_KEY) → api.anthropic.com (Bearer setup-token + beta)
+ * Stores nothing, logs nothing; only auth headers are normalized in flight.
  *
  * Auth source: `claude setup-token` long-lived token (sk-ant-oat01-..., ~1 year).
  * When it expires, generate a new one and `wrangler secret put CLAUDE_OAUTH_TOKEN`.
@@ -95,7 +96,7 @@ function buildUpstreamHeaders(req: Request, env: Env, cloaked: boolean): Headers
   if (cloaked) out.set("content-type", "application/json");
   if (!out.has("accept")) out.set("accept", "application/json");
   if (!out.has("user-agent")) {
-    out.set("user-agent", "claude-cli/2.0 (claude-oauth-worker)");
+    out.set("user-agent", "claude-cli/2.0 (mist)");
   }
   return out;
 }
@@ -192,7 +193,7 @@ function handleHealth(env: Env): Response {
   const token = env.CLAUDE_OAUTH_TOKEN?.trim() || "";
   return json({
     ok: true,
-    service: "claude-oauth-worker",
+    service: "mist",
     mode: "setup-token (no refresh)",
     hasToken: Boolean(token),
     tokenPrefix: token ? `${token.slice(0, 14)}...` : null,

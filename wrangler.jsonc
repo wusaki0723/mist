@@ -1,6 +1,6 @@
 {
 	"$schema": "./node_modules/wrangler/config-schema.json",
-	"name": "claude-oauth-worker",
+	"name": "mist",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-07-01",
 	"compatibility_flags": [
