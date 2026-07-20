@@ -105,6 +105,8 @@ function upstreamUrl(req: Request): URL {
   const src = new URL(req.url);
   let path = src.pathname;
   if (path.startsWith("/proxy")) path = path.slice("/proxy".length) || "/";
+  // Tolerate clients that double-prefix the API version: /v1/v1/* -> /v1/*
+  path = path.replace(/^(\/v1)+(?=\/)/, "/v1");
   if (!path.startsWith("/")) path = `/${path}`;
   return new URL(path + src.search, UPSTREAM);
 }
