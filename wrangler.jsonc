@@ -11,7 +11,6 @@
 	// - PROXY_API_KEY       client-facing key for Hana / Claude Code / scripts
 	// - CLAUDE_OAUTH_TOKEN  sk-ant-oat01-... from `claude setup-token` (valid ~1 year)
 	// - ANTHROPIC_API_KEY   sk-ant-api03-... official key, used when no OAuth token set
-	// - OPENROUTER_API_KEY  sk-or-... enables the /or/* pure-passthrough route
 	// Optional:
 	// - CLOAK               "false" to disable Claude Code system-prefix injection
 	// - CLIENT_UA           override the default client UA when the built-in one ages
