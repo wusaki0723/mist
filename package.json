@@ -1,8 +1,8 @@
 {
   "name": "mist",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
-  "description": "Privacy passthrough relay for Anthropic & OpenRouter, on Cloudflare Workers",
+  "description": "Privacy passthrough relay for the Anthropic API, on Cloudflare Workers",
   "license": "MIT",
   "repository": "github:wusaki0723/mist",
   "type": "module",

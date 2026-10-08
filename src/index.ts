@@ -1,10 +1,10 @@
 /**
- * mist v2 — 双路隐私透传中继（Cloudflare Workers）
+ * mist v2.1 — Anthropic 隐私透传中继（Cloudflare Workers）
  *
  * 路径布局：
  *   /health        状态自检（无需鉴权）
  *   /v1/*          → https://api.anthropic.com，按 Claude Agent SDK 形状归一化
- *   /or/*          → https://openrouter.ai/api/*，纯透传，不做任何伪装
+ *   /proxy/v1/*    /v1/* 的别名（兼容把 /proxy 写进 base_url 的客户端）
  *
  * 客户端统一用 PROXY_API_KEY 鉴权（x-api-key 或 Authorization: Bearer 均可）。
  * 上游真实凭据只存在 Cloudflare secret store，从不下发到客户端。
@@ -13,12 +13,9 @@
  *   CLAUDE_OAUTH_TOKEN   sk-ant-oat01-...，`claude setup-token` 产物（~1 年）
  *   ANTHROPIC_API_KEY    sk-ant-api03-...，官方 API key（SDK 形状可用）
  *
- * Cloak（仅 Anthropic 路径）：Anthropic 对 OAuth token 的非 Haiku 模型有
- * Claude Code system 前缀门控，缺前缀时自动补上；Agent SDK 本身也携带该前缀，
- * 因此这与真实客户端形状一致。CLOAK=false 关闭。
- *
- * OpenRouter 路径：纯透传。只摘除 hop-by-hop 头、客户端认证头和边缘注入头，
- * 注入 OPENROUTER_API_KEY，body 原样转发（流式不动）。无斗篷、无改写。
+ * Cloak：Anthropic 对 OAuth token 的非 Haiku 模型有 Claude Code system 前缀
+ * 门控，缺前缀时自动补上；Agent SDK 本身也携带该前缀，因此这与真实客户端
+ * 形状一致。CLOAK=false 关闭。
  */
 
 export interface Env {
@@ -28,8 +25,6 @@ export interface Env {
   CLAUDE_OAUTH_TOKEN?: string;
   /** 官方 API key（sk-ant-api03-...），OAuth 缺位时启用。 */
   ANTHROPIC_API_KEY?: string;
-  /** OpenRouter 上游 key（sk-or-...）。 */
-  OPENROUTER_API_KEY?: string;
   /** "false" 关闭 Anthropic 路径的 system 前缀补全。默认开启。 */
   CLOAK?: string;
   /** 覆盖默认的客户端 UA（版本老去时改这一个旋钮，不用动代码）。 */
@@ -37,9 +32,8 @@ export interface Env {
 }
 
 const UPSTREAM_ANTHROPIC = "https://api.anthropic.com";
-const UPSTREAM_OPENROUTER = "https://openrouter.ai/api";
 
-const VERSION = "2.0.0";
+const VERSION = "2.1.0";
 
 /**
  * 指纹优先级（明规则）：客户端自己带的头一律透传，下面的默认值
@@ -181,13 +175,6 @@ function buildAnthropicHeaders(
   return out;
 }
 
-function buildOpenRouterHeaders(req: Request, env: Env): Headers {
-  const out = copyClientHeaders(req);
-  out.set("authorization", `Bearer ${env.OPENROUTER_API_KEY!.trim()}`);
-  if (!out.has("user-agent")) out.set("user-agent", `mist/${VERSION}`);
-  return out;
-}
-
 function anthropicUrl(req: Request): URL | null {
   const src = new URL(req.url);
   let path = src.pathname;
@@ -202,14 +189,6 @@ function anthropicUrl(req: Request): URL | null {
   // 保险：origin 必须等于写死的上游
   if (url.origin !== UPSTREAM_ANTHROPIC) return null;
   return url;
-}
-
-function openRouterUrl(req: Request): URL {
-  const src = new URL(req.url);
-  let path = src.pathname.replace(/^\/or(?=\/|$)/, "");
-  if (!path.startsWith("/")) path = `/${path}`;
-  // 字符串拼接而不是 new URL(path, base)：path 以 / 开头时会吞掉 base 里的 /api
-  return new URL(UPSTREAM_OPENROUTER + path + src.search);
 }
 
 type TextBlock = { type?: string; text?: string };
@@ -402,30 +381,6 @@ async function proxyAnthropic(req: Request, env: Env): Promise<Response> {
   return relayResponse(upstream);
 }
 
-async function proxyOpenRouter(req: Request, env: Env): Promise<Response> {
-  if (!env.OPENROUTER_API_KEY?.trim()) {
-    return json({ error: "OPENROUTER_API_KEY secret is not configured" }, 500);
-  }
-
-  const method = req.method.toUpperCase();
-  const init: RequestInit = {
-    method: req.method,
-    headers: buildOpenRouterHeaders(req, env),
-    redirect: "manual",
-  };
-  if (method !== "GET" && method !== "HEAD" && req.body) {
-    // 纯透传：body 原样流式转发，一个比特都不碰
-    init.body = req.body;
-  }
-
-  const upstream = await fetch(openRouterUrl(req), init);
-  if (!upstream.ok) {
-    const detail = await readBounded(upstream.clone());
-    logError("upstream_error", req, { route: "openrouter", upstreamStatus: upstream.status, detail });
-  }
-  return relayResponse(upstream);
-}
-
 function handleHealth(env: Env): Response {
   const oauth = env.CLAUDE_OAUTH_TOKEN?.trim() || "";
   return json({
@@ -443,11 +398,6 @@ function handleHealth(env: Env): Response {
         signature: "claude-agent-sdk",
         clientUA: clientUA(env),
         clientUAOverridden: Boolean(env.CLIENT_UA?.trim()),
-      },
-      openrouter: {
-        path: "/or/*",
-        configured: Boolean(env.OPENROUTER_API_KEY?.trim()),
-        mode: "pure-passthrough",
       },
     },
   });
@@ -481,14 +431,13 @@ export default {
 
     const path = url.pathname;
     try {
-      if (path === "/or" || path.startsWith("/or/")) return await proxyOpenRouter(req, env);
       if (path.startsWith("/v1/") || path.startsWith("/proxy/")) {
         return await proxyAnthropic(req, env);
       }
       return json(
         {
           error: "unknown route",
-          hint: "Anthropic: base_url = https://<worker> (call /v1/messages); OpenRouter: base_url = https://<worker>/or",
+          hint: "Anthropic: base_url = https://<worker> (call /v1/messages; /proxy/v1/* also accepted)",
         },
         404,
       );
