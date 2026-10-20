@@ -42,6 +42,27 @@ Anthropic region-gates by the IP it sees — which is the Worker's egress, not y
 
 If all you want is multi-model access with your own keys, skip the relay: **OpenRouter**, **Vercel AI Gateway**, and **Cloudflare AI Gateway** all support BYOK and can be called directly. **Kilo Gateway** (`https://api.kilo.ai/api/gateway`, OpenAI-compatible) supports BYOK too, and additionally carries free models (`kilo-auto/free`, `:free` variants) that need no credits at all. None of these need a middleman — mist exists only for the narrow case of "my Anthropic subscription, from a clean fixed egress".
 
+## Claude Code 2.1.x: billing header, cc_gateway, wiggly-dove
+
+Verified against a real Claude Code 2.1.304 install behind a capture proxy:
+
+- The `x-anthropic-billing-header` attribution string is carried **inside `system[0]` of the request body** (not an HTTP header): `cc_version=…; cc_entrypoint=…;` plus optional `cc_workload`, `cc_project`, etc.
+- `cc_gateway` is appended only in gateway mode (`CLAUDE_CODE_USE_GATEWAY`) when the base URL is not exempt. The exemption list is `*.anthropic.com`, private/loopback ranges, and `host.docker.internal` — nothing else, and notably **not** `gateway.ai.cloudflare.com`. An explicit `hostVerdict: { vouched: … }` from server-side config can also exempt a host.
+- `x-claude-code-wiggly-dove` (gate `tengu_wiggly_dove`) exists in the binary but is still gated; it was not emitted in our tests. It is described as an environment report with an integrity check.
+
+Since 2.1.1, mist skips JSON re-serialization when the system string starts with the Claude Code prefix, or a system array contains a block starting with that prefix or the billing marker. The client beta header is preserved as received only when it already includes all required betas; otherwise missing values are appended. Authentication headers are still replaced, proxy headers stripped, and missing defaults filled in. These behaviors do not make the entire request byte-identical. **Compatibility with the gated integrity check has not been verified.**
+
+### Not getting marked: a local reverse proxy
+
+Loopback and private ranges are on the exemption list (they have to be — local router tools like claude-code-router live there), so the clean way to avoid the `cc_gateway` marker is a tiny local proxy in front of mist:
+
+```bash
+# local proxy listens on localhost:<port>, forwards to https://<your-worker>.<subdomain>.workers.dev
+export ANTHROPIC_BASE_URL="http://localhost:<port>"
+```
+
+Claude Code sees an exempt localhost URL and appends no `cc_gateway` marker — the request shape is identical to a local router tool. As a bonus, the proxy is a single choke point: every client goes through it, so routing policy lives in exactly one place. Two conditions: the proxy must forward the body **byte-for-byte** (any mutation is what integrity checks look for), and remember this is marker avoidance, not invisibility — if upstream ever cross-checks posture server-side, claim and reality need to match.
+
 ## ⚠️ Use at your own risk
 
 mist is a personal networking tool. Whether routing your account's traffic through a relay complies with upstream terms of service is your own determination to make. Account restrictions are a possibility you accept by using this. Provided as-is, without warranty of any kind; the authors accept no liability for account actions or any other damages. If losing access to your account would hurt, don't use it.
@@ -163,6 +184,27 @@ Anthropic 按它看到的 IP 做地区门控，而那个 IP 是 Worker 的出口
 ## 不需要 mist 的场景
 
 如果你只是想用自己的 key 调各家模型，别过中继：**OpenRouter**、**Vercel AI Gateway**、**Cloudflare AI Gateway** 都支持 BYOK，直连就行。**Kilo Gateway**（`https://api.kilo.ai/api/gateway`，OpenAI 兼容）同样支持 BYOK，还自带不要额度的免费模型（`kilo-auto/free` 和各种 `:free` 变体）。这些都不需要中间人——mist 只为一种窄场景存在："我的 Anthropic 订阅，要从干净固定的出口出去"。
+
+## Claude Code 2.1.x：billing 头、cc_gateway 与 wiggly-dove
+
+以下是在真机 Claude Code 2.1.304 + 抓包代理后的实测：
+
+- `x-anthropic-billing-header` 归属串**塞在请求体的 system[0] 里**（不是 HTTP 头）：`cc_version=…; cc_entrypoint=…;`，可附加 `cc_workload`、`cc_project` 等。
+- `cc_gateway` 只在网关模式（`CLAUDE_CODE_USE_GATEWAY`）且 base URL 不在豁免名单时追加。豁免名单只有 `*.anthropic.com`、内网/回环网段和 `host.docker.internal`——**没有** `gateway.ai.cloudflare.com`。服务端下发的 `hostVerdict: { vouched: … }` 也可以豁免某个域名。
+- `x-claude-code-wiggly-dove`（灰度门 `tengu_wiggly_dove`）在二进制里存在但仍被门控，实测未发出。据描述是带完整性校验的环境上报。
+
+2.1.1 起，如果 system 字符串以 Claude Code 前缀开头，或 system 数组中存在以前缀或 billing 标记开头的文本块，mist 会跳过 JSON 重序列化。客户端 beta 头只有在已覆盖全部必需项时才按接收到的值保留，否则仍会追加缺项。认证头仍会替换，代理头仍会剥除，缺失的默认头仍会补齐，因此不能据此声称整个请求字节不变。**尚未验证与灰度完整性校验的兼容性。**
+
+### 不被标记：本地反代
+
+回环和内网网段在豁免名单里（不得不在——claude-code-router 这类本地路由工具全住在那），所以避开 `cc_gateway` 标记的干净做法是在 mist 前面套一个本地小反代：
+
+```bash
+# 本地反代监听 localhost:<port>，转发到 https://<你的worker>.<subdomain>.workers.dev
+export ANTHROPIC_BASE_URL="http://localhost:<port>"
+```
+
+Claude Code 看到的是豁免的 localhost 地址，不追加 `cc_gateway` 标记——请求形状和本地路由工具完全一致。附带好处：反代是唯一的收口点，所有客户端都过它，路由策略只存在一个地方。两个条件：反代必须**逐字节**转发 body（任何改写都是完整性校验的目标）；并且记住这是标记规避不是隐身——上游哪天在服务端交叉验证出网姿态，声称和事实得对得上。
 
 ## ⚠️ 风险自担
 
