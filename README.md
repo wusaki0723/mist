@@ -20,7 +20,7 @@ mist **stores nothing and inspects nothing** beyond what is required to normaliz
 |---|---|---|
 | `/v1/*` | `api.anthropic.com` | Shaped to match the Claude Agent SDK. UA and `x-app` fill gaps only; beta flags merge on `/v1/messages*` alone; the Claude Code system prefix is added there when missing. Both OAuth setup-tokens and plain API keys work |
 | `/proxy/v1/*` | `api.anthropic.com` | Alias of `/v1/*`, for clients that bake `/proxy` into their base URL |
-| `/health` | — | Unauthenticated status check: which auth mode is live |
+| `/health` | — | Unauthenticated liveness check; pass `PROXY_API_KEY` to also see which auth mode is live |
 
 ## What it is
 
@@ -109,7 +109,11 @@ Saving a secret triggers a new deployment automatically.
 
 ```bash
 curl https://<your-worker>.<subdomain>.workers.dev/health
-# → { "hasToken": true, "looksLikeSetupToken": true, ... }
+# → { "ok": true, "service": "mist", "version": "..." }
+
+# with the client key, the full fingerprint shows up:
+curl -H "x-api-key: $PROXY_API_KEY" https://<your-worker>.<subdomain>.workers.dev/health
+# → { ..., "routes": { "anthropic": { "hasOAuthToken": true, "looksLikeSetupToken": true, ... } } }
 ```
 
 ### 5. Connect your client
@@ -165,7 +169,7 @@ Anthropic API 的隐私透传中继，跑在 Cloudflare Workers 上。
 |---|---|---|
 | `/v1/*` | `api.anthropic.com` | 出站形状对齐 Claude Agent SDK：UA 与 `x-app` 只补缺口；beta 标记只在 `/v1/messages*` 合并；Claude Code system 前缀缺了才补。OAuth setup-token 与普通 API key 都能用 |
 | `/proxy/v1/*` | `api.anthropic.com` | `/v1/*` 的别名，兼容把 `/proxy` 写进 base_url 的客户端 |
-| `/health` | — | 无需鉴权的自检：认证模式一目了然 |
+| `/health` | — | 无需鉴权的存活探测；带对 `PROXY_API_KEY` 才展示认证模式等配置指纹 |
 
 ## 为什么
 
@@ -218,7 +222,7 @@ mist 是个人网络工具。把账号流量经由中继转发是否符合上游
    - `PROXY_API_KEY`：自编长随机串（客户端用它认证）
    - `CLAUDE_OAUTH_TOKEN`：第 1 步那串（配了就优先用它）
    - `ANTHROPIC_API_KEY`：可选，普通 `sk-ant-api03-...` key。没配 OAuth token 时启用；OAuth 返回 401 时自动用它兜底重试一次
-4. **验证**：`curl https://<你的worker>.<subdomain>.workers.dev/health` 看各路径状态
+4. **验证**：`curl https://<你的worker>.<subdomain>.workers.dev/health` 看存活；再带 `-H "x-api-key: $PROXY_API_KEY"` 看配置指纹
 5. **接客户端**：
    - Claude 系：base URL 填 Worker 地址（不带 `/v1`），API key 填 `PROXY_API_KEY`
    - Hana：Anthropic provider 填 worker 地址，key 填 `PROXY_API_KEY`
@@ -226,7 +230,7 @@ mist 是个人网络工具。把账号流量经由中继转发是否符合上游
 ## 可选旋钮
 
 - `CLOAK=false`：关闭 Anthropic 路径的 system 前缀补全（可用模型范围可能缩小）
-- `CLIENT_UA`：覆盖默认客户端 UA。内置默认是 `claude-cli/2.1.293 …`，版本老去时改它即可，不用动代码。`/health` 里能看到当前生效值
+- `CLIENT_UA`：覆盖默认客户端 UA。内置默认是 `claude-cli/2.1.296 (external, sdk-cli)`（2026-10-12 实测值），版本老去时改它即可，不用动代码。鉴权后的 `/health` 里能看到当前生效值
 
 指纹优先级是硬规则：**客户端自己发的头原样透传，默认值只补缺口**。真 Agent SDK 调进来时形状端到端不变。
 

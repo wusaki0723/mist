@@ -2,7 +2,7 @@
  * mist v2.1 — Anthropic 隐私透传中继（Cloudflare Workers）
  *
  * 路径布局：
- *   /health        状态自检（无需鉴权）
+ *   /health        存活自检（无需鉴权；带对 PROXY_API_KEY 才返回配置指纹）
  *   /v1/*          → https://api.anthropic.com，按 Claude Agent SDK 形状归一化
  *   /proxy/v1/*    /v1/* 的别名（兼容把 /proxy 写进 base_url 的客户端）
  *
@@ -47,8 +47,14 @@ const VERSION = "2.1.1";
  * 真客户端标记（前缀或 billing 块）就原样转发，不做 JSON 重序列化；
  * beta 已覆盖就原样透传，不重排。改写只发生在裸客户端身上。
  */
-const DEFAULT_CLIENT_UA =
-  "claude-cli/2.1.293 (external, sdk-ts, agent-sdk/0.3.293)";
+/**
+ * 默认客户端 UA，保鲜到今晚（2026-10-12）实测值：
+ * `claude -p` 模式真实发出的是 `(external, sdk-cli)` 形状，
+ * Agent SDK (TypeScript) 是 `(external, sdk-ts, agent-sdk/x.y.z)`，
+ * 两者都是官方允许的订阅程序化通道，默认取实测过的前者。
+ * 版本老去时用 CLIENT_UA 旋钮换，不用动代码。
+ */
+const DEFAULT_CLIENT_UA = "claude-cli/2.1.296 (external, sdk-cli)";
 
 /** 客户端 UA：CLIENT_UA 变量/密钥优先，其次内置默认。 */
 function clientUA(env: Env): string {
@@ -65,6 +71,14 @@ const OAUTH_BETA = "oauth-2025-04-20";
 
 const CLAUDE_CODE_PREFIX =
   "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/**
+ * 2026-10-12 实测（2.1.296）：真实客户端还携带计费归因头
+ *   x-anthropic-billing-header: cc_version=2.1.296.406; cc_entrypoint=sdk-cli
+ * 策略：客户端自带则透传（它不在剥离名单里），不主动补默认值——
+ * entrypoint 与真实通道不符比缺席更像个破绽。订阅 OAuth 场景下
+ * 该头是否参与门控尚无证据，观察到再动。
+ */
 
 const HOP_BY_HOP = new Set([
   "connection",
@@ -119,10 +133,24 @@ function clientKey(req: Request): string {
   return m?.[1]?.trim() || "";
 }
 
+/** 常量时间比较，挡时序旁路。长度不等直接判负（key 长度非秘密）。 */
+function keysEqual(a: string, b: string): boolean {
+  const ba = new TextEncoder().encode(a);
+  const bb = new TextEncoder().encode(b);
+  if (ba.byteLength !== bb.byteLength) return false;
+  // Workers 运行时的原生实现；Node 测试环境没有，降级为逐字节异或
+  if (typeof crypto.subtle.timingSafeEqual === "function") {
+    return crypto.subtle.timingSafeEqual(ba, bb);
+  }
+  let diff = 0;
+  for (let i = 0; i < ba.byteLength; i++) diff |= ba[i] ^ bb[i];
+  return diff === 0;
+}
+
 function assertProxyAuth(req: Request, env: Env): Response | null {
   const expected = env.PROXY_API_KEY?.trim();
   if (!expected) return json({ error: "PROXY_API_KEY secret is not configured" }, 500);
-  if (clientKey(req) !== expected) return json({ error: "unauthorized" }, 401);
+  if (!keysEqual(clientKey(req), expected)) return json({ error: "unauthorized" }, 401);
   return null;
 }
 
@@ -203,6 +231,9 @@ function anthropicUrl(req: Request): URL | null {
   const url = new URL(UPSTREAM_ANTHROPIC + path + src.search);
   // 保险：origin 必须等于写死的上游
   if (url.origin !== UPSTREAM_ANTHROPIC) return null;
+  // new URL 会归一化点段（含 %2e 编码形式）：/v1/../x 会变成 /x。
+  // 归一化后再查一次前缀，守住 /v1/* 硬门
+  if (!url.pathname.startsWith("/v1/")) return null;
   return url;
 }
 
@@ -407,8 +438,11 @@ async function proxyAnthropic(req: Request, env: Env): Promise<Response> {
   return relayResponse(upstream);
 }
 
-function handleHealth(env: Env): Response {
+function handleHealth(env: Env, authed: boolean): Response {
+  // 公开健康检查只报活着；配置指纹要带对 PROXY_API_KEY 才给看
+  if (!authed) return json({ ok: true, service: "mist", version: VERSION });
   const oauth = env.CLAUDE_OAUTH_TOKEN?.trim() || "";
+  const apikey = env.ANTHROPIC_API_KEY?.trim() || "";
   return json({
     ok: true,
     service: "mist",
@@ -416,12 +450,12 @@ function handleHealth(env: Env): Response {
     routes: {
       anthropic: {
         path: "/v1/*",
-        auth: oauth ? "oauth-setup-token" : env.ANTHROPIC_API_KEY?.trim() ? "api-key" : null,
+        auth: oauth ? "oauth-setup-token" : apikey ? "api-key" : null,
         hasOAuthToken: Boolean(oauth),
         looksLikeSetupToken: oauth.startsWith("sk-ant-oat01-"),
-        hasApiKey: Boolean(env.ANTHROPIC_API_KEY?.trim()),
+        hasApiKey: Boolean(apikey),
         cloak: cloakEnabled(env),
-        signature: "claude-agent-sdk",
+        signature: "claude-code-client",
         clientUA: clientUA(env),
         clientUAOverridden: Boolean(env.CLIENT_UA?.trim()),
       },
@@ -430,7 +464,7 @@ function handleHealth(env: Env): Response {
 }
 
 // 供回归测试使用的内部实现（不改变 Worker 的默认导出行为）
-export { anthropicUrl, anthropicBody, buildAnthropicHeaders, cloakSystem, mergeBetas, clientUA };
+export { anthropicUrl, anthropicBody, buildAnthropicHeaders, cloakSystem, mergeBetas, clientUA, handleHealth };
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
@@ -449,7 +483,10 @@ export default {
     }
 
     if (url.pathname === "/health" || url.pathname === "/") {
-      return handleHealth(env);
+      // 无需鉴权的存活探测；带对 key 才返回配置指纹
+      const expected = env.PROXY_API_KEY?.trim() || "";
+      const authed = Boolean(expected) && keysEqual(clientKey(req), expected);
+      return handleHealth(env, authed);
     }
 
     const denied = assertProxyAuth(req, env);

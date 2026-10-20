@@ -8,6 +8,7 @@ import {
   cloakSystem,
   mergeBetas,
   clientUA,
+  handleHealth,
 } from '../src/index.ts';
 
 const env = {
@@ -19,6 +20,55 @@ const env = {
 function req(path: string, headers: Record<string, string> = {}, method = 'POST') {
   return new Request(`https://worker.example${path}`, { method, headers });
 }
+
+// ── 点段/编码点段逃逸：new URL 归一化后再守一次门 ──
+
+test('点段与 %2e 编码逃逸被拒绝', () => {
+  // 注意：new Request() 在 URL 解析层已归一化点段，所以这些请求到达
+  // anthropicUrl 时已是归一化形态；'/v1/../../v1/models' 归一化后是合法的
+  // /v1/models，自然放行。真正的防线是归一化后的第二道 /v1/ 前缀检查。
+  assert.equal(anthropicUrl(req('/v1/../v1beta/models')), null);
+  assert.equal(anthropicUrl(req('/v1/%2e%2e/v1beta/models')), null);
+  assert.equal(anthropicUrl(req('/proxy/v1/../v1beta/models')), null);
+  assert.equal(
+    anthropicUrl(req('/v1/../../v1/models'))?.toString(),
+    'https://api.anthropic.com/v1/models',
+  );
+  // 正常路径不受误伤
+  assert.equal(
+    anthropicUrl(req('/v1/messages/count_tokens'))?.toString(),
+    'https://api.anthropic.com/v1/messages/count_tokens',
+  );
+});
+
+// ── /health 分级：未鉴权只报活着 ──
+
+test('/health 未鉴权不露配置指纹，鉴权后才给', async () => {
+  const pub = (await handleHealth(env, false).json()) as any;
+  assert.equal(pub.ok, true);
+  assert.equal(pub.routes, undefined);
+  const priv = (await handleHealth(env, true).json()) as any;
+  assert.equal(priv.routes.anthropic.hasOAuthToken, true);
+  assert.equal(priv.routes.anthropic.cloak, true);
+});
+
+test('端到端：匿名 /health 分级、带 key 给指纹、/v1 未鉴权 401', async () => {
+  const { default: worker } = await import('../src/index.ts');
+  const anon = await worker.fetch(req('/health', {}, 'GET'), env);
+  const anonBody = (await anon.json()) as any;
+  assert.equal(anonBody.ok, true);
+  assert.equal(anonBody.routes, undefined);
+
+  const authed = await worker.fetch(
+    req('/health', { 'x-api-key': 'test-proxy-key' }, 'GET'),
+    env,
+  );
+  const authedBody = (await authed.json()) as any;
+  assert.equal(authedBody.routes.anthropic.hasOAuthToken, true);
+
+  const denied = await worker.fetch(req('/v1/messages'), env);
+  assert.equal(denied.status, 401);
+});
 
 // ── 开放代理逃逸（PR #1 评审主条）──
 
