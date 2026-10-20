@@ -33,12 +33,19 @@ export interface Env {
 
 const UPSTREAM_ANTHROPIC = "https://api.anthropic.com";
 
-const VERSION = "2.1.0";
+const VERSION = "2.1.1";
 
 /**
  * 指纹优先级（明规则）：客户端自己带的头一律透传，下面的默认值
  * 只补缺口。真实 Agent SDK 调进来时形状保持原样；裸客户端（curl、
  * Hana 等）才被补上这套实测签名。
+ *
+ * 字节透明（2.1.1 起）：新版 Claude Code（2.1.x，实测 2.1.304）把
+ * x-anthropic-billing-header 塞进 system[0]（含 cc_gateway 网关标记），
+ * 并灰度 x-claude-code-wiggly-dove 环境上报（带完整性校验）。应对策略
+ * 是绝不摘除、绝不伪造，且对形状完好的客户端字节级不动：body 识别出
+ * 真客户端标记（前缀或 billing 块）就原样转发，不做 JSON 重序列化；
+ * beta 已覆盖就原样透传，不重排。改写只发生在裸客户端身上。
  */
 const DEFAULT_CLIENT_UA =
   "claude-cli/2.1.293 (external, sdk-ts, agent-sdk/0.3.293)";
@@ -70,6 +77,7 @@ const HOP_BY_HOP = new Set([
   "upgrade",
   "host",
   "content-length",
+  "via",
 ]);
 
 /**
@@ -87,6 +95,9 @@ const EDGE_INJECTED = new Set([
   "x-forwarded-host",
   "x-forwarded-proto",
   "x-forwarded-server",
+  "forwarded",
+  "x-cluster-client-ip",
+  "x-envoy-external-address",
 ]);
 
 function json(data: unknown, status = 200): Response {
@@ -122,13 +133,17 @@ function cloakEnabled(env: Env): boolean {
 function mergeBetas(incoming: string | null, withOAuth: boolean): string {
   const base = withOAuth ? `${BASE_BETAS},${OAUTH_BETA}` : BASE_BETAS;
   if (!incoming?.trim()) return base;
-  const parts = new Set(
-    `${base},${incoming}`
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean),
-  );
-  return [...parts].join(",");
+  const required = base.split(",");
+  const inParts = incoming
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const have = new Set(inParts);
+  // 客户端已覆盖全部所需 beta：原样透传。重排/重写会改变字节，
+  // 在新版 Claude Code 的完整性校验下等于自曝中转身份。
+  if (required.every((b) => have.has(b))) return incoming;
+  // 缺啥补啥：保持客户端原有顺序，缺的追加在后
+  return [...inParts, ...required.filter((b) => !have.has(b))].join(",");
 }
 
 /** 透传客户端头，剥掉 hop-by-hop / 边缘注入 / 客户端认证三类。 */
@@ -193,6 +208,8 @@ function anthropicUrl(req: Request): URL | null {
 
 type TextBlock = { type?: string; text?: string };
 
+const BILLING_MARKER = "x-anthropic-billing-header:";
+
 /** 给 body.system 补上 Claude Code 前缀（已存在则不动）。 */
 function cloakSystem(bodyText: string): string {
   let data: Record<string, unknown>;
@@ -205,16 +222,25 @@ function cloakSystem(bodyText: string): string {
 
   const sys = data.system;
   if (typeof sys === "string") {
-    if (!sys.startsWith(CLAUDE_CODE_PREFIX)) {
-      data.system = `${CLAUDE_CODE_PREFIX}\n\n${sys}`;
-    }
+    // 已带前缀：字节级原样返回，绝不走 JSON 重序列化——
+    // 重序列化会改变字节，等于在上游的完整性校验下自曝中转。
+    if (sys.startsWith(CLAUDE_CODE_PREFIX)) return bodyText;
+    data.system = `${CLAUDE_CODE_PREFIX}\n\n${sys}`;
     return JSON.stringify(data);
   }
   if (Array.isArray(sys)) {
-    const first = sys[0] as TextBlock | undefined;
-    const already =
-      first && typeof first.text === "string" && first.text.startsWith(CLAUDE_CODE_PREFIX);
-    if (!already) sys.unshift({ type: "text", text: CLAUDE_CODE_PREFIX });
+    // 真客户端判定：任一块带 Claude Code 前缀（旧形状），或带
+    // x-anthropic-billing-header 标记（2.1.x 新形状：system[0] 是
+    // billing 块，前缀不再单独出现）。命中即字节级透传，绝不 unshift。
+    const genuine = sys.some((b) => {
+      const t = (b as TextBlock | undefined)?.text;
+      return (
+        typeof t === "string" &&
+        (t.startsWith(CLAUDE_CODE_PREFIX) || t.startsWith(BILLING_MARKER))
+      );
+    });
+    if (genuine) return bodyText;
+    sys.unshift({ type: "text", text: CLAUDE_CODE_PREFIX });
     return JSON.stringify(data);
   }
   data.system = CLAUDE_CODE_PREFIX;

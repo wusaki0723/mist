@@ -205,3 +205,64 @@ test('mergeBetas 与客户端 beta 取并集且去重', () => {
   assert.ok(parts.includes('custom-x'));
   assert.ok(parts.includes('oauth-2025-04-20'));
 });
+
+
+// ── 2.1.1 字节透明：wiggly-dove 时代的自保 ──
+
+test('cloak: system 数组带 billing 标记时字节级透传（CC 2.1.x 新形状）', () => {
+  // 实测 Claude Code 2.1.304：system[0] 是 billing 块，前缀不再单独出现
+  const real =
+    '{"model":"claude-sonnet-4-5","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.304.120; cc_entrypoint=sdk-cli;"},{"type":"text","text":"You are a Claude agent, built on Anthropic\'s Claude Agent SDK."}],"messages":[]}';
+  assert.equal(cloakSystem(real), real);
+});
+
+test('cloak: 字符串前缀已带时字节级透传（不走 JSON 重序列化）', () => {
+  const real = '{"system":"You are Claude Code, Anthropic\'s official CLI for Claude.\\n\\n内容","messages":[]}';
+  assert.equal(cloakSystem(real), real);
+});
+
+test('cloak: 数组首块带前缀时字节级透传', () => {
+  const real = '{"system":[{"type":"text","text":"You are Claude Code, Anthropic\'s official CLI for Claude."}],"messages":[]}';
+  assert.equal(cloakSystem(real), real);
+});
+
+test('cloak: 裸客户端数组无前缀无 billing 才注入', () => {
+  const out = JSON.parse(cloakSystem('{"system":[{"type":"text","text":"原提示"}],"messages":[]}'));
+  assert.equal(out.system[0].text, PREFIX);
+});
+
+test('mergeBetas 客户端已覆盖时原样透传（不重排）', () => {
+  const covered =
+    'custom-first,claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,thinking-display-updates-2026-08-18,oauth-2025-04-20';
+  assert.equal(mergeBetas(covered, true), covered);
+});
+
+test('mergeBetas 缺项时保持客户端顺序、缺失追加在后', () => {
+  const merged = mergeBetas('my-beta,claude-code-20250219', false);
+  const parts = merged.split(',');
+  assert.equal(parts[0], 'my-beta');
+  assert.equal(parts[1], 'claude-code-20250219');
+  assert.ok(parts.includes('interleaved-thinking-2025-05-14'));
+});
+
+// ── 2.1.1 头部卫生：IP 泄漏面补齐 ──
+
+test('forwarded / via / envoy 系 IP 头被剥掉', () => {
+  const h = buildAnthropicHeaders(
+    req('/v1/messages', {
+      forwarded: 'for=203.0.113.7;proto=https',
+      via: '1.1 some-proxy',
+      'x-cluster-client-ip': '203.0.113.7',
+      'x-envoy-external-address': '203.0.113.7',
+      'x-forwarded-for': '203.0.113.7',
+      'true-client-ip': '203.0.113.7',
+      'cf-connecting-ip': '203.0.113.7',
+      'cf-ipcountry': 'CN',
+    }),
+    env, true, true, true,
+  );
+  for (const k of ['forwarded', 'via', 'x-cluster-client-ip', 'x-envoy-external-address',
+    'x-forwarded-for', 'true-client-ip', 'cf-connecting-ip', 'cf-ipcountry']) {
+    assert.equal(h.get(k), null, `${k} 应该被剥掉`);
+  }
+});
