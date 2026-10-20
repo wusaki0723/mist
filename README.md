@@ -52,6 +52,17 @@ Verified against a real Claude Code 2.1.304 install behind a capture proxy:
 
 mist's posture is **transparency, not forgery**: these markers are forwarded untouched, and since 2.1.1 mist never rewrites a well-formed client's request byte-wise (no JSON re-serialization, no beta re-ordering) — the relay is invisible at the byte level, which is the only posture that survives an integrity check. Stripping or spoofing these fields would be exactly what the check is designed to catch.
 
+### Not getting marked: a local reverse proxy
+
+Loopback and private ranges are on the exemption list (they have to be — local router tools like claude-code-router live there), so the clean way to avoid the `cc_gateway` marker is a tiny local proxy in front of mist:
+
+```bash
+# local proxy listens on localhost:<port>, forwards to https://<your-worker>.<subdomain>.workers.dev
+export ANTHROPIC_BASE_URL="http://localhost:<port>"
+```
+
+Claude Code sees an exempt localhost URL and appends no `cc_gateway` marker — the request shape is identical to a local router tool. As a bonus, the proxy is a single choke point: every client goes through it, so routing policy lives in exactly one place. Two conditions: the proxy must forward the body **byte-for-byte** (any mutation is what integrity checks look for), and remember this is marker avoidance, not invisibility — if upstream ever cross-checks posture server-side, claim and reality need to match.
+
 ## ⚠️ Use at your own risk
 
 mist is a personal networking tool. Whether routing your account's traffic through a relay complies with upstream terms of service is your own determination to make. Account restrictions are a possibility you accept by using this. Provided as-is, without warranty of any kind; the authors accept no liability for account actions or any other damages. If losing access to your account would hurt, don't use it.
@@ -183,6 +194,17 @@ Anthropic 按它看到的 IP 做地区门控，而那个 IP 是 Worker 的出口
 - `x-claude-code-wiggly-dove`（灰度门 `tengu_wiggly_dove`）在二进制里存在但仍被门控，实测未发出。据描述是带完整性校验的环境上报。
 
 mist 的立场是**透明，不是伪造**：这些标记原样透传；2.1.1 起 mist 对形状完好的客户端做到字节级不动（不做 JSON 重序列化、不重排 beta）——在字节层面让中继不可见，这是唯一能在完整性校验下存活的姿势。摘除或伪造这些字段，恰好是校验设计来抓的行为。
+
+### 不被标记：本地反代
+
+回环和内网网段在豁免名单里（不得不在——claude-code-router 这类本地路由工具全住在那），所以避开 `cc_gateway` 标记的干净做法是在 mist 前面套一个本地小反代：
+
+```bash
+# 本地反代监听 localhost:<port>，转发到 https://<你的worker>.<subdomain>.workers.dev
+export ANTHROPIC_BASE_URL="http://localhost:<port>"
+```
+
+Claude Code 看到的是豁免的 localhost 地址，不追加 `cc_gateway` 标记——请求形状和本地路由工具完全一致。附带好处：反代是唯一的收口点，所有客户端都过它，路由策略只存在一个地方。两个条件：反代必须**逐字节**转发 body（任何改写都是完整性校验的目标）；并且记住这是标记规避不是隐身——上游哪天在服务端交叉验证出网姿态，声称和事实得对得上。
 
 ## ⚠️ 风险自担
 
