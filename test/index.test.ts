@@ -216,14 +216,37 @@ test('cloak: system 数组带 billing 标记时字节级透传（CC 2.1.x 新形
   assert.equal(cloakSystem(real), real);
 });
 
-test('cloak: 字符串前缀已带时字节级透传（不走 JSON 重序列化）', () => {
-  const real = '{"system":"You are Claude Code, Anthropic\'s official CLI for Claude.\\n\\n内容","messages":[]}';
+test('cloak: 字符串前缀已带时保留 JSON 缩进与尾随换行', () => {
+  const real = JSON.stringify({ system: PREFIX + '\n\n内容', messages: [] }, null, 2) + '\n';
   assert.equal(cloakSystem(real), real);
 });
 
-test('cloak: 数组首块带前缀时字节级透传', () => {
-  const real = '{"system":[{"type":"text","text":"You are Claude Code, Anthropic\'s official CLI for Claude."}],"messages":[]}';
+test('cloak: 数组首块带前缀时保留 JSON 缩进与尾随换行', () => {
+  const real = JSON.stringify({ system: [{ type: 'text', text: PREFIX }], messages: [] }, null, 2) + '\n';
   assert.equal(cloakSystem(real), real);
+});
+
+test('anthropicBody: 已识别的 system 形态保留正文格式且不标 rewritten', async () => {
+  for (const system of [
+    PREFIX + '\n\n内容',
+    [{ type: 'text', text: PREFIX }],
+    [
+      { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.304.120; cc_entrypoint=sdk-cli;' },
+      { type: 'text', text: "You are a Claude agent, built on Anthropic's Claude Agent SDK." },
+    ],
+  ]) {
+    const body = JSON.stringify({ system, messages: [] }, null, 2) + '\n';
+    const r = new Request('https://worker.example/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json; charset=utf-8' },
+      body,
+    });
+    const out = await anthropicBody(r, env, '/v1/messages');
+    assert.equal(out.body, body);
+    assert.equal(out.rewritten, false);
+    const headers = buildAnthropicHeaders(r, env, true, out.rewritten, true);
+    assert.equal(headers.get('content-type'), 'application/json; charset=utf-8');
+  }
 });
 
 test('cloak: 裸客户端数组无前缀无 billing 才注入', () => {

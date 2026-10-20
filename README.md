@@ -50,7 +50,7 @@ Verified against a real Claude Code 2.1.304 install behind a capture proxy:
 - `cc_gateway` is appended only in gateway mode (`CLAUDE_CODE_USE_GATEWAY`) when the base URL is not exempt. The exemption list is `*.anthropic.com`, private/loopback ranges, and `host.docker.internal` — nothing else, and notably **not** `gateway.ai.cloudflare.com`. An explicit `hostVerdict: { vouched: … }` from server-side config can also exempt a host.
 - `x-claude-code-wiggly-dove` (gate `tengu_wiggly_dove`) exists in the binary but is still gated; it was not emitted in our tests. It is described as an environment report with an integrity check.
 
-mist's posture is **transparency, not forgery**: these markers are forwarded untouched, and since 2.1.1 mist never rewrites a well-formed client's request byte-wise (no JSON re-serialization, no beta re-ordering) — the relay is invisible at the byte level, which is the only posture that survives an integrity check. Stripping or spoofing these fields would be exactly what the check is designed to catch.
+Since 2.1.1, mist skips JSON re-serialization when the system string starts with the Claude Code prefix, or a system array contains a block starting with that prefix or the billing marker. The client beta header is preserved as received only when it already includes all required betas; otherwise missing values are appended. Authentication headers are still replaced, proxy headers stripped, and missing defaults filled in. These behaviors do not make the entire request byte-identical. **Compatibility with the gated integrity check has not been verified.**
 
 ### Not getting marked: a local reverse proxy
 
@@ -193,7 +193,7 @@ Anthropic 按它看到的 IP 做地区门控，而那个 IP 是 Worker 的出口
 - `cc_gateway` 只在网关模式（`CLAUDE_CODE_USE_GATEWAY`）且 base URL 不在豁免名单时追加。豁免名单只有 `*.anthropic.com`、内网/回环网段和 `host.docker.internal`——**没有** `gateway.ai.cloudflare.com`。服务端下发的 `hostVerdict: { vouched: … }` 也可以豁免某个域名。
 - `x-claude-code-wiggly-dove`（灰度门 `tengu_wiggly_dove`）在二进制里存在但仍被门控，实测未发出。据描述是带完整性校验的环境上报。
 
-mist 的立场是**透明，不是伪造**：这些标记原样透传；2.1.1 起 mist 对形状完好的客户端做到字节级不动（不做 JSON 重序列化、不重排 beta）——在字节层面让中继不可见，这是唯一能在完整性校验下存活的姿势。摘除或伪造这些字段，恰好是校验设计来抓的行为。
+2.1.1 起，如果 system 字符串以 Claude Code 前缀开头，或 system 数组中存在以前缀或 billing 标记开头的文本块，mist 会跳过 JSON 重序列化。客户端 beta 头只有在已覆盖全部必需项时才按接收到的值保留，否则仍会追加缺项。认证头仍会替换，代理头仍会剥除，缺失的默认头仍会补齐，因此不能据此声称整个请求字节不变。**尚未验证与灰度完整性校验的兼容性。**
 
 ### 不被标记：本地反代
 
