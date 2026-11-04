@@ -1,84 +1,26 @@
-/**
- * mist v2.1 — Anthropic 隐私透传中继（Cloudflare Workers）
- *
- * 路径布局：
- *   /health        存活自检（无需鉴权；带对 PROXY_API_KEY 才返回配置指纹）
- *   /v1/*          → https://api.anthropic.com，按 Claude Agent SDK 形状归一化
- *   /proxy/v1/*    /v1/* 的别名（兼容把 /proxy 写进 base_url 的客户端）
- *
- * 客户端统一用 PROXY_API_KEY 鉴权（x-api-key 或 Authorization: Bearer 均可）。
- * 上游真实凭据只存在 Cloudflare secret store，从不下发到客户端。
- *
- * Anthropic 路径的上游认证（二选一，OAuth 优先）：
- *   CLAUDE_OAUTH_TOKEN   sk-ant-oat01-...，`claude setup-token` 产物（~1 年）
- *   ANTHROPIC_API_KEY    sk-ant-api03-...，官方 API key（SDK 形状可用）
- *
- * Cloak：Anthropic 对 OAuth token 的非 Haiku 模型有 Claude Code system 前缀
- * 门控，缺前缀时自动补上；Agent SDK 本身也携带该前缀，因此这与真实客户端
- * 形状一致。CLOAK=false 关闭。
- */
-
 export interface Env {
-  /** 客户端与 mist 之间的钥匙。 */
   PROXY_API_KEY: string;
-  /** Claude OAuth setup-token（sk-ant-oat01-...）。 */
   CLAUDE_OAUTH_TOKEN?: string;
-  /** 官方 API key（sk-ant-api03-...），OAuth 缺位时启用。 */
   ANTHROPIC_API_KEY?: string;
-  /** "false" 关闭 Anthropic 路径的 system 前缀补全。默认开启。 */
+  /** "false" 原样转发正文和客户端头，不补兼容默认值。 */
   CLOAK?: string;
-  /** 覆盖默认的客户端 UA（版本老去时改这一个旋钮，不用动代码）。 */
   CLIENT_UA?: string;
 }
 
 const UPSTREAM_ANTHROPIC = "https://api.anthropic.com";
+const VERSION = "2.2.0";
+const MAX_BUFFERED_BODY = 16 * 1024 * 1024;
+const DEFAULT_CLIENT_UA = "claude-cli/2.1.318 (external, sdk-cli)";
 
-const VERSION = "2.1.1";
-
-/**
- * 指纹优先级（明规则）：客户端自己带的头一律透传，下面的默认值
- * 只补缺口。真实 Agent SDK 调进来时形状保持原样；裸客户端（curl、
- * Hana 等）才被补上这套实测签名。
- *
- * 字节透明（2.1.1 起）：新版 Claude Code（2.1.x，实测 2.1.304）把
- * x-anthropic-billing-header 塞进 system[0]（含 cc_gateway 网关标记），
- * 并灰度 x-claude-code-wiggly-dove 环境上报（带完整性校验）。应对策略
- * 是绝不摘除、绝不伪造，且对形状完好的客户端字节级不动：body 识别出
- * 真客户端标记（前缀或 billing 块）就原样转发，不做 JSON 重序列化；
- * beta 已覆盖就原样透传，不重排。改写只发生在裸客户端身上。
- */
-/**
- * 默认客户端 UA，保鲜到今晚（2026-10-12）实测值：
- * `claude -p` 模式真实发出的是 `(external, sdk-cli)` 形状，
- * Agent SDK (TypeScript) 是 `(external, sdk-ts, agent-sdk/x.y.z)`，
- * 两者都是官方允许的订阅程序化通道，默认取实测过的前者。
- * 版本老去时用 CLIENT_UA 旋钮换，不用动代码。
- */
-const DEFAULT_CLIENT_UA = "claude-cli/2.1.296 (external, sdk-cli)";
-
-/** 客户端 UA：CLIENT_UA 变量/密钥优先，其次内置默认。 */
 function clientUA(env: Env): string {
   return env.CLIENT_UA?.trim() || DEFAULT_CLIENT_UA;
 }
 
-/**
- * 实测 Agent SDK 默认携带的 beta 全集（2026-10 抓包）。
- * oauth-2025-04-20 仅在使用 OAuth token 时附加，x-api-key 请求不掺这个。
- */
 const BASE_BETAS =
-  "interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,claude-code-20250219,advisor-tool-2026-03-01,thinking-display-updates-2026-08-18";
-const OAUTH_BETA = "oauth-2025-04-20";
-
+  "claude-code-20250219,interleaved-thinking-2025-05-14,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,thinking-token-count-2026-05-13,effort-2025-11-24";
+const OAUTH_BETAS = "oauth-2025-04-20,extended-cache-ttl-2025-04-11";
 const CLAUDE_CODE_PREFIX =
   "You are Claude Code, Anthropic's official CLI for Claude.";
-
-/**
- * 2026-10-12 实测（2.1.296）：真实客户端还携带计费归因头
- *   x-anthropic-billing-header: cc_version=2.1.296.406; cc_entrypoint=sdk-cli
- * 策略：客户端自带则透传（它不在剥离名单里），不主动补默认值——
- * entrypoint 与真实通道不符比缺席更像个破绽。订阅 OAuth 场景下
- * 该头是否参与门控尚无证据，观察到再动。
- */
 
 const HOP_BY_HOP = new Set([
   "connection",
@@ -94,21 +36,11 @@ const HOP_BY_HOP = new Set([
   "via",
 ]);
 
-/**
- * 边缘或前置反代注入的头（cf-* 来自 Cloudflare，x-real-ip / x-forwarded-*
- * 来自客户端侧的跳板）。官方客户端永远不会发这些：转发等于告诉上游
- * 真实客户端 IP 和链路层数，必须剥掉。
- * SDK 自报头（user-agent、x-stainless-*、x-app）刻意保留。
- */
 const EDGE_INJECTED = new Set([
   "cdn-loop",
   "true-client-ip",
   "x-client-ip",
   "x-real-ip",
-  "x-forwarded-for",
-  "x-forwarded-host",
-  "x-forwarded-proto",
-  "x-forwarded-server",
   "forwarded",
   "x-cluster-client-ip",
   "x-envoy-external-address",
@@ -159,7 +91,7 @@ function cloakEnabled(env: Env): boolean {
 }
 
 function mergeBetas(incoming: string | null, withOAuth: boolean): string {
-  const base = withOAuth ? `${BASE_BETAS},${OAUTH_BETA}` : BASE_BETAS;
+  const base = withOAuth ? `${BASE_BETAS},${OAUTH_BETAS}` : BASE_BETAS;
   if (!incoming?.trim()) return base;
   const required = base.split(",");
   const inParts = incoming
@@ -167,8 +99,6 @@ function mergeBetas(incoming: string | null, withOAuth: boolean): string {
     .map((s) => s.trim())
     .filter(Boolean);
   const have = new Set(inParts);
-  // 客户端已覆盖全部所需 beta：原样透传。重排/重写会改变字节，
-  // 在新版 Claude Code 的完整性校验下等于自曝中转身份。
   if (required.every((b) => have.has(b))) return incoming;
   // 缺啥补啥：保持客户端原有顺序，缺的追加在后
   return [...inParts, ...required.filter((b) => !have.has(b))].join(",");
@@ -181,7 +111,7 @@ function copyClientHeaders(req: Request): Headers {
     const lower = k.toLowerCase();
     if (HOP_BY_HOP.has(lower)) continue;
     if (lower === "authorization" || lower === "x-api-key") continue;
-    if (lower.startsWith("cf-")) continue;
+    if (lower.startsWith("cf-") || lower.startsWith("x-forwarded-")) continue;
     if (EDGE_INJECTED.has(lower)) continue;
     out.set(k, v);
   }
@@ -205,8 +135,10 @@ function buildAnthropicHeaders(
     out.delete("authorization");
   }
 
+  if (!cloakEnabled(env)) return out;
+
   out.set("anthropic-version", req.headers.get("anthropic-version") || "2023-06-01");
-  // beta 合并只发生在 /v1/messages 家族；其它路径原样透传客户端的 beta，避免上游 400
+  // 兼容默认值只补缺口，批请求保留客户端自己的 beta。
   if (isMessages) {
     out.set("anthropic-beta", mergeBetas(req.headers.get("anthropic-beta"), useOAuth));
   }
@@ -253,16 +185,12 @@ function cloakSystem(bodyText: string): string {
 
   const sys = data.system;
   if (typeof sys === "string") {
-    // 已带前缀：字节级原样返回，绝不走 JSON 重序列化——
-    // 重序列化会改变字节，等于在上游的完整性校验下自曝中转。
     if (sys.startsWith(CLAUDE_CODE_PREFIX)) return bodyText;
     data.system = `${CLAUDE_CODE_PREFIX}\n\n${sys}`;
     return JSON.stringify(data);
   }
   if (Array.isArray(sys)) {
-    // 真客户端判定：任一块带 Claude Code 前缀（旧形状），或带
-    // x-anthropic-billing-header 标记（2.1.x 新形状：system[0] 是
-    // billing 块，前缀不再单独出现）。命中即字节级透传，绝不 unshift。
+    // 保留已有前缀与计费标记，不重序列化。
     const genuine = sys.some((b) => {
       const t = (b as TextBlock | undefined)?.text;
       return (
@@ -284,70 +212,58 @@ interface AnthropicBody {
   rewritten: boolean;
 }
 
-/** /v1/messages 家族判定：等于或以其为前缀（count_tokens、batches 等子接口都算）。 */
 function isMessagesPath(path: string): boolean {
-  return path === "/v1/messages" || path.startsWith("/v1/messages/");
+  return path === "/v1/messages" || path === "/v1/messages/count_tokens";
 }
 
-/**
- * Anthropic 路径的出站 body：
- * - GET/HEAD：无 body
- * - /v1/messages 家族且 cloak 开：缓冲为文本、补前缀；只有真的被改写才标 rewritten
- * - 双凭据都在（可能 401 回退重试）：按字节缓冲（arrayBuffer，不损二进制）
- * - 其它一切：原样流式透传，不碰
- */
+class BodyTooLarge extends Error {}
+
+async function readBody(body: ReadableStream<Uint8Array>): Promise<ArrayBuffer> {
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_BUFFERED_BODY) {
+        void reader.cancel().catch(() => {});
+        throw new BodyTooLarge();
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes.buffer;
+}
+
 async function anthropicBody(
   req: Request,
   env: Env,
   normalizedPath: string,
 ): Promise<AnthropicBody> {
-  const method = req.method.toUpperCase();
-  if (method === "GET" || method === "HEAD") return { rewritten: false };
-
-  if (isMessagesPath(normalizedPath) && cloakEnabled(env)) {
-    const text = await req.text();
-    if (!text) return { rewritten: false };
-    const cloaked = cloakSystem(text);
-    return { body: cloaked, rewritten: cloaked !== text };
-  }
-
+  if (req.method === "GET" || req.method === "HEAD" || !req.body) return { rewritten: false };
+  const encoding = req.headers.get("content-encoding")?.trim().toLowerCase();
+  const rewrite = isMessagesPath(normalizedPath) && cloakEnabled(env) && (!encoding || encoding === "identity");
   const canFallback = Boolean(env.CLAUDE_OAUTH_TOKEN?.trim() && env.ANTHROPIC_API_KEY?.trim());
-  if (canFallback) {
-    const buf = await req.arrayBuffer();
-    if (!buf.byteLength) return { rewritten: false };
-    return { body: buf, rewritten: false };
-  }
-  return { body: req.body ?? undefined, rewritten: false };
-}
+  if (!rewrite && !canFallback) return { body: req.body, rewritten: false };
 
-/** 读上游错误体，最多 max 字节，读完就扔，不拖住流。 */
-async function readBounded(res: Response, max = 2048): Promise<string> {
-  if (!res.body) return "";
-  const reader = res.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      total += value.byteLength;
-      if (total >= max) break;
-    }
-  } catch {
-    /* 上游断了就算了 */
-  } finally {
-    reader.cancel().catch(() => {});
+  const body = await readBody(req.body);
+  if (!body.byteLength) return { rewritten: false };
+  if (rewrite) {
+    const text = new TextDecoder().decode(body);
+    const cloaked = cloakSystem(text);
+    if (cloaked !== text) return { body: cloaked, rewritten: true };
   }
-  const buf = new Uint8Array(Math.min(total, max));
-  let off = 0;
-  for (const c of chunks) {
-    if (off >= max) break;
-    const slice = c.subarray(0, Math.min(c.byteLength, max - off));
-    buf.set(slice, off);
-    off += slice.byteLength;
-  }
-  return new TextDecoder().decode(buf);
+  return { body, rewritten: false };
 }
 
 /**
@@ -362,7 +278,6 @@ function logError(event: string, req: Request, fields: Record<string, unknown>):
       method: req.method,
       path: new URL(req.url).pathname,
       ray: req.headers.get("cf-ray"),
-      ua: req.headers.get("user-agent"),
       ...fields,
     }),
   );
@@ -427,12 +342,10 @@ async function proxyAnthropic(req: Request, env: Env): Promise<Response> {
   }
 
   if (!upstream.ok) {
-    const detail = await readBounded(upstream.clone());
     logError("upstream_error", req, {
       route: "anthropic",
       upstreamStatus: upstream.status,
       auth: usedOAuth ? "oauth" : "api-key",
-      detail,
     });
   }
   return relayResponse(upstream);
@@ -455,9 +368,9 @@ function handleHealth(env: Env, authed: boolean): Response {
         looksLikeSetupToken: oauth.startsWith("sk-ant-oat01-"),
         hasApiKey: Boolean(apikey),
         cloak: cloakEnabled(env),
-        signature: "claude-code-client",
-        clientUA: clientUA(env),
-        clientUAOverridden: Boolean(env.CLIENT_UA?.trim()),
+        signature: cloakEnabled(env) ? "claude-code-client" : null,
+        clientUA: cloakEnabled(env) ? clientUA(env) : null,
+        clientUAOverridden: cloakEnabled(env) && Boolean(env.CLIENT_UA?.trim()),
       },
     },
   });
@@ -505,9 +418,9 @@ export default {
         404,
       );
     } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      logError("proxy_exception", req, { error: message });
-      return json({ error: message }, 502);
+      if (e instanceof BodyTooLarge) return json({ error: "request body exceeds 16 MiB buffer limit" }, 413);
+      logError("proxy_exception", req, {});
+      return json({ error: "upstream request failed" }, 502);
     }
   },
 };

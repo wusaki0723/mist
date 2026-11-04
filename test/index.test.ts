@@ -1,7 +1,8 @@
 // mist 回归测试：node --experimental-strip-types --test test/*.test.ts
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import {
+import { gzipSync } from 'node:zlib';
+import worker, {
   anthropicUrl,
   anthropicBody,
   buildAnthropicHeaders,
@@ -140,6 +141,26 @@ test('x-api-key 模式不掺 oauth beta', () => {
   const beta = h.get('anthropic-beta')!;
   assert.ok(beta.includes('claude-code-20250219'));
   assert.ok(!beta.includes('oauth-2025-04-20'));
+});
+
+test('Claude Code 2.1.318 实测头不被追加旧 beta 或重排', () => {
+  const apiBetas = 'claude-code-20250219,interleaved-thinking-2025-05-14,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,thinking-token-count-2026-05-13,effort-2025-11-24';
+  const oauthBetas = 'oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,claude-code-20250219,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,thinking-token-count-2026-05-13,effort-2025-11-24,extended-cache-ttl-2025-04-11';
+  for (const [useOAuth, beta] of [[false, apiBetas], [true, oauthBetas]] as const) {
+    const incoming = {
+      'user-agent': 'claude-cli/2.1.318 (external, sdk-cli)',
+      'anthropic-beta': beta,
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true',
+      'x-app': 'cli',
+      'x-stainless-runtime': 'node',
+      'x-stainless-runtime-version': 'v26.12.1',
+      'x-claude-code-session-id': 'sample-session',
+      'x-claude-code-wiggly-dove': 'client-integrity-value',
+    };
+    const h = buildAnthropicHeaders(req('/v1/messages', incoming), env, useOAuth, false, true);
+    for (const [key, value] of Object.entries(incoming)) assert.equal(h.get(key), value, key);
+  }
 });
 
 test('/v1/models 不动客户端的 beta，缺省不补', () => {
@@ -292,7 +313,7 @@ test('anthropicBody: 已识别的 system 形态保留正文格式且不标 rewri
       body,
     });
     const out = await anthropicBody(r, env, '/v1/messages');
-    assert.equal(out.body, body);
+    assert.deepEqual(new Uint8Array(out.body as ArrayBuffer), new TextEncoder().encode(body));
     assert.equal(out.rewritten, false);
     const headers = buildAnthropicHeaders(r, env, true, out.rewritten, true);
     assert.equal(headers.get('content-type'), 'application/json; charset=utf-8');
@@ -306,7 +327,7 @@ test('cloak: 裸客户端数组无前缀无 billing 才注入', () => {
 
 test('mergeBetas 客户端已覆盖时原样透传（不重排）', () => {
   const covered =
-    'custom-first,claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,thinking-display-updates-2026-08-18,oauth-2025-04-20';
+    'custom-first, claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,effort-2025-11-24,oauth-2025-04-20,extended-cache-ttl-2025-04-11';
   assert.equal(mergeBetas(covered, true), covered);
 });
 
@@ -328,6 +349,8 @@ test('forwarded / via / envoy 系 IP 头被剥掉', () => {
       'x-cluster-client-ip': '203.0.113.7',
       'x-envoy-external-address': '203.0.113.7',
       'x-forwarded-for': '203.0.113.7',
+      'x-forwarded-client-ip': '203.0.113.8',
+      'x-forwarded-for-original': '203.0.113.9',
       'true-client-ip': '203.0.113.7',
       'cf-connecting-ip': '203.0.113.7',
       'cf-ipcountry': 'CN',
@@ -335,7 +358,158 @@ test('forwarded / via / envoy 系 IP 头被剥掉', () => {
     env, true, true, true,
   );
   for (const k of ['forwarded', 'via', 'x-cluster-client-ip', 'x-envoy-external-address',
-    'x-forwarded-for', 'true-client-ip', 'cf-connecting-ip', 'cf-ipcountry']) {
+    'x-forwarded-for', 'x-forwarded-client-ip', 'x-forwarded-for-original', 'true-client-ip', 'cf-connecting-ip', 'cf-ipcountry']) {
     assert.equal(h.get(k), null, `${k} 应该被剥掉`);
   }
+});
+
+test('CLOAK=false 保留正文和客户端标记，仍剥代理头与替换认证', async () => {
+  const rawEnv = { ...env, CLOAK: 'false', CLIENT_UA: 'ignored/1' };
+  const bytes = new Uint8Array([0, 255, 128, 123, 125]);
+  const r = new Request('https://worker.example/v1/messages', {
+    method: 'POST', body: bytes,
+    headers: {
+      'x-api-key': env.PROXY_API_KEY,
+      'anthropic-beta': 'custom-beta',
+      'x-stainless-lang': 'typescript',
+      'x-anthropic-billing-header': 'client-value',
+      'cf-connecting-ip': '203.0.113.7',
+      'x-forwarded-client-ip': '203.0.113.7',
+    },
+  });
+  const out = await anthropicBody(r, rawEnv, '/v1/messages');
+  assert.equal(out.rewritten, false);
+  assert.deepEqual(new Uint8Array(out.body as ArrayBuffer), bytes);
+  const h = buildAnthropicHeaders(r, rawEnv, true, out.rewritten, true);
+  assert.equal(h.get('authorization'), `Bearer ${env.CLAUDE_OAUTH_TOKEN}`);
+  assert.equal(h.get('x-api-key'), null);
+  assert.equal(h.get('anthropic-beta'), 'custom-beta');
+  assert.equal(h.get('x-stainless-lang'), 'typescript');
+  assert.equal(h.get('x-anthropic-billing-header'), 'client-value');
+  for (const name of ['cf-connecting-ip', 'x-forwarded-client-ip', 'user-agent', 'x-app', 'anthropic-version', 'accept', 'content-type']) {
+    assert.equal(h.get(name), null, name);
+  }
+  const health = await handleHealth(rawEnv, true).json() as any;
+  assert.equal(health.routes.anthropic.signature, null);
+  assert.equal(health.routes.anthropic.clientUA, null);
+});
+
+test('批请求不注入顶层 system，也不追加兼容 beta', async (t) => {
+  const body = JSON.stringify({ requests: [{ custom_id: 'one', params: { system: 'mine', messages: [] } }] });
+  const upstream = t.mock.method(globalThis, 'fetch', async (_url: unknown, init: RequestInit) => {
+    assert.equal(new TextDecoder().decode(init.body as ArrayBuffer), body);
+    assert.equal(new Headers(init.headers).get('anthropic-beta'), 'batch-beta');
+    return new Response('{}');
+  });
+  const r = await worker.fetch(new Request('https://worker.example/proxy/v1/messages/batches', {
+    method: 'POST', body,
+    headers: { 'x-api-key': env.PROXY_API_KEY, 'anthropic-beta': 'batch-beta' },
+  }), env);
+  assert.equal(r.status, 200);
+  assert.equal(upstream.mock.callCount(), 1);
+});
+
+test('gzip 正文在 OAuth 401 回退后仍逐字节一致', async (t) => {
+  const bytes = gzipSync('{"messages":[],"system":"mine"}');
+  t.mock.method(console, 'error', () => {});
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async (_url: unknown, init: RequestInit) => {
+    const h = new Headers(init.headers);
+    assert.deepEqual(new Uint8Array(init.body as ArrayBuffer), new Uint8Array(bytes));
+    assert.equal(h.get('content-encoding'), 'gzip');
+    assert.equal(h.get('content-type'), 'application/json');
+    if (++calls === 1) {
+      assert.equal(h.get('authorization'), `Bearer ${env.CLAUDE_OAUTH_TOKEN}`);
+      return new Response('expired', { status: 401 });
+    }
+    assert.equal(h.get('x-api-key'), env.ANTHROPIC_API_KEY);
+    assert.equal(h.get('authorization'), null);
+    assert.ok(!h.get('anthropic-beta')!.includes('oauth-2025-04-20'));
+    return new Response('ok');
+  });
+  const r = await worker.fetch(new Request('https://worker.example/v1/messages', {
+    method: 'POST', body: bytes,
+    headers: { 'x-api-key': env.PROXY_API_KEY, 'content-encoding': 'gzip', 'content-type': 'application/json' },
+  }), env);
+  assert.equal(await r.text(), 'ok');
+  assert.equal(calls, 2);
+});
+
+test('单凭据无需改写时保留流，不受缓冲上限影响', async () => {
+  const singleEnv = { PROXY_API_KEY: env.PROXY_API_KEY, ANTHROPIC_API_KEY: env.ANTHROPIC_API_KEY };
+  for (const [path, headers, config] of [
+    ['/v1/files', {}, singleEnv],
+    ['/v1/messages', { 'content-encoding': 'gzip' }, singleEnv],
+    ['/v1/messages', {}, { ...singleEnv, CLOAK: 'false' }],
+  ] as const) {
+    const r = new Request(`https://worker.example${path}`, {
+      method: 'POST', headers, body: new Uint8Array(16 * 1024 * 1024 + 1),
+    });
+    const out = await anthropicBody(r, config, path);
+    assert.equal(out.body, r.body);
+    assert.equal(r.bodyUsed, false);
+    await r.body!.cancel();
+  }
+});
+
+test('改写和回退缓冲均在实际正文超限时返回 413', async (t) => {
+  const upstream = t.mock.method(globalThis, 'fetch', async () => new Response('unexpected'));
+  for (const [path, config] of [
+    ['/v1/messages', { ...env, ANTHROPIC_API_KEY: undefined }],
+    ['/v1/files', env],
+  ] as const) {
+    let canceled = false;
+    let count = 0;
+    const body = new ReadableStream({
+      pull(controller) {
+        controller.enqueue(new Uint8Array(count++ < 16 ? 1024 * 1024 : 1));
+      },
+      cancel() { canceled = true; },
+    });
+    const r = await worker.fetch(new Request(`https://worker.example${path}`, {
+      method: 'POST', body, duplex: 'half',
+      headers: { 'x-api-key': env.PROXY_API_KEY, 'content-length': '1' },
+    } as RequestInit), config);
+    assert.equal(r.status, 413);
+    assert.equal(canceled, true);
+  }
+  assert.equal(upstream.mock.callCount(), 0);
+});
+
+test('16 MiB 正文仍可缓冲', async () => {
+  const r = new Request('https://worker.example/v1/files', {
+    method: 'POST', body: new Uint8Array(16 * 1024 * 1024),
+  });
+  const out = await anthropicBody(r, env, '/v1/files');
+  assert.equal((out.body as ArrayBuffer).byteLength, 16 * 1024 * 1024);
+});
+
+test('上游错误流无需结束即可返回，日志不读取敏感正文', { timeout: 1000 }, async (t) => {
+  let controller: ReadableStreamDefaultController<Uint8Array>;
+  const body = new ReadableStream<Uint8Array>({ start(c) { controller = c; } });
+  t.after(() => controller.close());
+  const log = t.mock.method(console, 'error', () => {});
+  t.mock.method(globalThis, 'fetch', async () => new Response(body, { status: 400 }));
+  const r = await worker.fetch(new Request('https://worker.example/v1/messages', {
+    method: 'POST', body: '{"system":"private-input"}',
+    headers: { 'x-api-key': env.PROXY_API_KEY, 'user-agent': 'private-ua' },
+  }), env);
+  assert.equal(r.status, 400);
+  const entry = JSON.parse(log.mock.calls[0].arguments[0]);
+  assert.equal(entry.upstreamStatus, 400);
+  assert.equal(entry.detail, undefined);
+  assert.equal(entry.ua, undefined);
+  controller!.enqueue(new TextEncoder().encode('private-upstream-error'));
+  const reader = r.body!.getReader();
+  assert.equal(new TextDecoder().decode((await reader.read()).value), 'private-upstream-error');
+  reader.releaseLock();
+});
+
+test('异常原文不进入日志或 502 响应', async (t) => {
+  const log = t.mock.method(console, 'error', () => {});
+  t.mock.method(globalThis, 'fetch', async () => { throw new Error('private-token-and-input'); });
+  const r = await worker.fetch(req('/v1/models', { 'x-api-key': env.PROXY_API_KEY }, 'GET'), env);
+  assert.equal(r.status, 502);
+  assert.deepEqual(await r.json(), { error: 'upstream request failed' });
+  assert.ok(!JSON.stringify(log.mock.calls).includes('private-token-and-input'));
 });

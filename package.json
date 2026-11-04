@@ -1,6 +1,6 @@
 {
   "name": "mist",
-  "version": "2.1.1",
+  "version": "2.2.0",
   "private": true,
   "description": "Privacy passthrough relay for the Anthropic API, on Cloudflare Workers",
   "license": "MIT",
@@ -13,8 +13,8 @@
     "test": "node --experimental-strip-types --test test/*.test.ts"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20260714.1",
-    "typescript": "^5.9.3",
-    "wrangler": "^4.112.0"
+    "@cloudflare/workers-types": "^5.20261104.1",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.157.0"
   }
 }
